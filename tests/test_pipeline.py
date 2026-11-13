@@ -4,48 +4,12 @@ from __future__ import annotations
 import sqlite3
 import time
 
-import pytest
 from fastapi.testclient import TestClient
 
 from app import config
 from app.main import create_app
 
-T0 = 1_731_400_000
-
-
-@pytest.fixture()
-def env(tmp_path, monkeypatch):
-    data_dir = tmp_path / "data"
-    work_dir = data_dir / "work"
-    data_dir.mkdir()
-    monkeypatch.setattr(config, "DATA_DIR", data_dir.resolve())
-    monkeypatch.setattr(config, "DB_PATH", (data_dir / "portal.db").resolve())
-    monkeypatch.setattr(config, "WORK_DIR", work_dir.resolve())
-    monkeypatch.setattr(config, "POLL_INTERVAL_SECONDS", 0.05)
-    return data_dir
-
-
-@pytest.fixture()
-def client(env, monkeypatch):
-    # The worker runs as a task inside the application's own event loop.
-    monkeypatch.setattr(config, "RUN_WORKER_IN_PROCESS", True)
-    app = create_app()
-    with TestClient(app) as c:
-        yield c
-
-
-def _ingest(c, logs):
-    return c.post("/logs", json={"logs": logs}).raise_for_status().json()
-
-
-def _wait_idle(c, visitor_id, timeout=10.0):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        resp = c.get(f"/visitors/{visitor_id}/sessions").raise_for_status().json()
-        if not resp["pending_rebuild"]:
-            return resp
-        time.sleep(0.05)
-    raise AssertionError("rebuild did not finish in time")
+from .conftest import T0, ingest as _ingest, wait_idle as _wait_idle
 
 
 def test_ingest_rebuild_and_query_flow(client):
@@ -202,7 +166,7 @@ def test_stale_rebuild_cannot_overwrite_newer_result(client, monkeypatch):
 
     def slow_compute(self, work_path):
         time.sleep(0.4)
-        return original(self, work_path)
+        return original(work_path)  # _compute is a staticmethod
 
     monkeypatch.setattr(worker_mod.RebuildWorker, "_compute", slow_compute)
 

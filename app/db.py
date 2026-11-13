@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import aiosqlite
 
-from .config import DB_PATH
+from . import config
 
 SCHEMA = """
 PRAGMA journal_mode = WAL;
@@ -70,9 +70,13 @@ CREATE TABLE IF NOT EXISTS published_generations (
 """
 
 
-async def connect(db_path=DB_PATH) -> aiosqlite.Connection:
-    """Open an autocommit connection; transactions are managed explicitly."""
-    conn = await aiosqlite.connect(str(db_path), isolation_level=None)
+async def connect(db_path=None) -> aiosqlite.Connection:
+    """Open an autocommit connection; transactions are managed explicitly.
+
+    ``db_path`` defaults to the configured path *at call time* so tests and
+    embedding applications can relocate the database.
+    """
+    conn = await aiosqlite.connect(str(db_path or config.DB_PATH), isolation_level=None)
     conn.row_factory = aiosqlite.Row
     await conn.execute("PRAGMA journal_mode = WAL")
     await conn.execute("PRAGMA foreign_keys = ON")

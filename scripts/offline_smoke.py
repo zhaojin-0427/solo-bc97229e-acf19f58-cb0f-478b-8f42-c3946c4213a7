@@ -11,11 +11,14 @@ import json
 import sqlite3
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.sessions import reconstruct_sessions  # noqa: E402
+from app import analytics  # noqa: E402  (stdlib-only imports; aiosqlite is lazy)
 
 T0 = 1_731_400_000
 failures = []
@@ -147,6 +150,88 @@ with tempfile.TemporaryDirectory() as tmp:
           conn.execute("SELECT COUNT(*) FROM sessions WHERE visitor_id='v1' AND version=3")
           .fetchone()[0] == 0)
     conn.close()
+
+# --------------------------------------------------- analytics sandbox engine
+# execute_analyst_query is pure stdlib: in-memory sandbox DB, authorizer,
+# progress-handler deadline. Verify the security properties offline.
+_snapshot = [
+    ("visitor-7", 2, 0, T0, T0 + 60, '["/news/ai-2026", "/products/42"]'),
+    ("visitor-7", 2, 1, T0 + 4000, T0 + 4000, '["/news/llm"]'),
+    ("visitor-9", 1, 0, T0 + 10, T0 + 70, '["/news/ai-2026"]'),
+]
+_cancel = threading.Event()
+_deadline = time.monotonic() + 10
+
+cols, rows, truncated = analytics.execute_analyst_query(
+    "SELECT visitor_id, COUNT(*) AS sessions, SUM(end_ts - start_ts) AS secs "
+    "FROM current_sessions GROUP BY visitor_id ORDER BY visitor_id",
+    _snapshot, deadline=_deadline, cancel_event=_cancel, max_rows=1000)
+check("analytics aggregation",
+      cols == ["visitor_id", "sessions", "secs"]
+      and rows == [["visitor-7", 2, 60], ["visitor-9", 1, 60]])
+
+_, rows, _ = analytics.execute_analyst_query(
+    "SELECT je.value AS page, COUNT(*) FROM current_sessions s "
+    "JOIN json_each(s.page_paths) je GROUP BY je.value ORDER BY je.value",
+    _snapshot, deadline=_deadline, cancel_event=_cancel, max_rows=1000)
+check("json_each expansion", rows == [["/news/ai-2026", 2], ["/news/llm", 1],
+                                      ["/products/42", 1]])
+
+_, rows, _ = analytics.execute_analyst_query(
+    "WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM seq WHERE x<3) "
+    "SELECT COUNT(*) FROM seq",
+    _snapshot, deadline=_deadline, cancel_event=_cancel, max_rows=1000)
+check("WITH RECURSIVE + COUNT(*) over CTE", rows == [[3]])
+
+_, rows, truncated = analytics.execute_analyst_query(
+    "WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM seq WHERE x<5000) "
+    "SELECT x FROM seq",
+    _snapshot, deadline=_deadline, cancel_event=_cancel, max_rows=1000)
+check("row cap truncates at 1000", len(rows) == 1000 and truncated)
+
+
+def _expect(exc_type, sql):
+    try:
+        analytics.execute_analyst_query(
+            sql, _snapshot, deadline=_deadline, cancel_event=_cancel, max_rows=10)
+    except exc_type:
+        return True
+    except Exception as e:  # wrong error type
+        print(f"    (unexpected {type(e).__name__}: {e})")
+        return False
+    return False
+
+
+check("raw_logs read refused", _expect(analytics.ForbiddenError,
+                                       "SELECT * FROM raw_logs"))
+check("old-version table refused", _expect(analytics.ForbiddenError,
+                                           "SELECT * FROM sessions"))
+check("schema read refused", _expect(analytics.ForbiddenError,
+                                     "SELECT sql FROM sqlite_master"))
+check("subquery equally restricted",
+      _expect(analytics.ForbiddenError,
+              "SELECT * FROM current_sessions WHERE visitor_id IN "
+              "(SELECT visitor_id FROM raw_logs)"))
+check("load_extension refused", _expect(analytics.ForbiddenError,
+                                        "SELECT load_extension('/tmp/x')"))
+check("write refused", _expect(analytics.AnalyticsError,
+                               "DELETE FROM current_sessions"))
+check("attach refused", _expect(analytics.AnalyticsError,
+                                "ATTACH DATABASE '/tmp/x.db' AS stolen"))
+check("non-select refused", _expect(analytics.BadQueryError, "PRAGMA user_version"))
+
+# timeout: a huge recursive scan must be interrupted at the deadline
+late = time.monotonic() + 0.2
+started = time.monotonic()
+timed_out = False
+try:
+    analytics.execute_analyst_query(
+        "WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM seq "
+        "WHERE x<1000000000) SELECT SUM(x) FROM seq",
+        _snapshot, deadline=late, cancel_event=threading.Event(), max_rows=10)
+except analytics.QueryTimeoutError:
+    timed_out = True
+check("deadline terminates execution", timed_out and time.monotonic() - started < 5)
 
 print()
 if failures:

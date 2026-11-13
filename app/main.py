@@ -1,18 +1,24 @@
 """FastAPI application: log ingestion, correction and session queries."""
 from __future__ import annotations
 
+import asyncio
 import json
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Any
 
 import aiosqlite
-from fastapi import FastAPI, HTTPException
+from fastapi import Body, FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, Response
 
-from . import config
+from . import analytics, config
+from .analytics import AnalyticsError
 from .config import ensure_dirs
 from .db import connect, init_db
 from .schemas import (
+    AnalyticsQueryRequest,
+    AnalyticsQueryResponse,
     IngestReport,
     IngestRequest,
     IngestResponse,
@@ -40,6 +46,10 @@ def create_app() -> FastAPI:
     )
 
     state: dict[str, Any] = {"db": None, "worker": None}
+
+    @app.exception_handler(AnalyticsError)
+    async def _analytics_error_handler(_request: Request, exc: AnalyticsError):
+        return JSONResponse(status_code=exc.status_code, content={"detail": str(exc)})
 
     @app.on_event("startup")
     async def _startup() -> None:
@@ -158,21 +168,24 @@ def create_app() -> FastAPI:
                     )
                 )
 
-                # Bump every visitor whose input changed: the new owner, and
-                # the previous owner when the event was reassigned.
+                # Mark every visitor whose input changed: the new owner, and
+                # the previous owner when the event was reassigned. Versions
+                # are bumped once per visitor per batch (see below).
                 touched = {entry.visitor_id}
                 if old_visitor:
                     touched.add(old_visitor)
                 for vid in touched:
-                    await db.execute(
-                        "INSERT INTO visitor_versions(visitor_id, version) VALUES (?, 1) "
-                        "ON CONFLICT(visitor_id) DO UPDATE SET version = version + 1",
-                        (vid,),
-                    )
                     affected.setdefault(vid, set()).add(entry.log_id)
                     requeued_visitors.add(vid)
 
             for vid in requeued_visitors:
+                # One accepted batch moves a visitor's input version forward
+                # by exactly one, no matter how many of its events changed.
+                await db.execute(
+                    "INSERT INTO visitor_versions(visitor_id, version) VALUES (?, 1) "
+                    "ON CONFLICT(visitor_id) DO UPDATE SET version = version + 1",
+                    (vid,),
+                )
                 ver_row = await db.execute_fetchall(
                     "SELECT version FROM visitor_versions WHERE visitor_id = ?", (vid,)
                 )
@@ -274,6 +287,133 @@ def create_app() -> FastAPI:
             input_version=input_version,
             generations=gen_out,
         )
+
+    # ------------------------------------------------------------------ analytics
+    @app.post(
+        "/analytics/query",
+        response_model=AnalyticsQueryResponse,
+        tags=["analytics"],
+        responses={
+            400: {"description": "Not a single SELECT/WITH statement or invalid SQL"},
+            403: {"description": "Query stepped outside the current_sessions allowlist"},
+            499: {"description": "Client disconnected; the query was aborted"},
+            504: {"description": "Execution + fetching exceeded the 2 second budget"},
+        },
+    )
+    async def analytics_query(
+        request: Request,
+        payload: AnalyticsQueryRequest = Body(
+            ...,
+            openapi_examples={
+                "topic_reading_depth": {
+                    "summary": "专题阅读深度：自选页面组合的会话数与持续秒数",
+                    "value": {
+                        "sql": "SELECT COUNT(*) AS sessions, "
+                        "SUM(end_ts - start_ts) AS total_seconds "
+                        "FROM current_sessions AS s "
+                        "WHERE EXISTS (SELECT 1 FROM json_each(s.page_paths) AS je "
+                        "WHERE je.value IN ('/news/ai-2026', '/products/42'))"
+                    },
+                },
+                "per_visitor_stats": {
+                    "summary": "每访客的会话数与总阅读秒数",
+                    "value": {
+                        "sql": "SELECT visitor_id, COUNT(*) AS sessions, "
+                        "SUM(end_ts - start_ts) AS total_seconds "
+                        "FROM current_sessions "
+                        "GROUP BY visitor_id ORDER BY total_seconds DESC"
+                    },
+                },
+                "per_page_stats": {
+                    "summary": "逐页面访问统计（json_each 展开 page_paths）",
+                    "value": {
+                        "sql": "SELECT je.value AS page_path, COUNT(*) AS visits "
+                        "FROM current_sessions AS s "
+                        "JOIN json_each(s.page_paths) AS je "
+                        "GROUP BY je.value ORDER BY visits DESC"
+                    },
+                },
+                "forbidden_raw_logs": {
+                    "summary": "越权示例：读取原始日志（被拒绝，403）",
+                    "value": {"sql": "SELECT * FROM raw_logs"},
+                },
+                "forbidden_attach": {
+                    "summary": "越权示例：ATTACH 附加库（被拒绝，400）",
+                    "value": {"sql": "ATTACH DATABASE '/data/portal.db' AS stolen"},
+                },
+            },
+        ),
+    ) -> AnalyticsQueryResponse | Response:
+        """Run one read-only SQL query over the ``current_sessions`` table.
+
+        ``current_sessions`` exposes the newest published session generation
+        of every visitor: ``visitor_id``, ``version``, ``session_index``,
+        ``start_ts``, ``end_ts`` and ``page_paths`` (JSON array). A single
+        SQLite ``SELECT`` (``WITH`` clauses and JSON functions such as
+        ``json_extract`` / ``json_each`` supported) is executed against one
+        consistent publish snapshot while ingestion and background publishing
+        continue. At most 1000 rows are returned (``truncated`` flags more).
+        Execution + fetching is capped at 2 seconds; exceeding queries are
+        terminated and answered with 504. Reading raw logs, older versions,
+        the schema or any other table — from subqueries as well — is rejected
+        with 403, as are writes, ATTACH and disallowed functions.
+        """
+        cancel = threading.Event()
+        deadline = time.monotonic() + config.ANALYTICS_TIMEOUT_SECONDS
+
+        async def _run() -> AnalyticsQueryResponse:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise analytics.QueryTimeoutError(
+                    "no time budget left before the query even started"
+                )
+            try:
+                snapshot = await asyncio.wait_for(
+                    analytics.extract_current_sessions(), timeout=remaining
+                )
+            except asyncio.TimeoutError as exc:
+                raise analytics.QueryTimeoutError(
+                    "extracting the publish snapshot exceeded the time budget"
+                ) from exc
+            columns, rows, truncated = await asyncio.to_thread(
+                analytics.execute_analyst_query,
+                payload.sql,
+                snapshot,
+                deadline=deadline,
+                cancel_event=cancel,
+                max_rows=config.ANALYTICS_MAX_ROWS,
+            )
+            return AnalyticsQueryResponse(
+                columns=columns, rows=rows, row_count=len(rows), truncated=truncated
+            )
+
+        async def _watch_disconnect() -> None:
+            while True:
+                if await request.is_disconnected():
+                    return
+                await asyncio.sleep(0.05)
+
+        query_task = asyncio.create_task(_run())
+        disconnect_task = asyncio.create_task(_watch_disconnect())
+        try:
+            done, _ = await asyncio.wait(
+                {query_task, disconnect_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if disconnect_task in done and not query_task.done():
+                # The client went away: cancel the actual computation (the
+                # SQLite progress handler interrupts the VM) and wait for the
+                # worker thread to release its connection before responding.
+                cancel.set()
+                try:
+                    await asyncio.wait_for(asyncio.shield(query_task), timeout=3.0)
+                except Exception:
+                    pass
+                return Response(status_code=499)
+            return query_task.result()
+        finally:
+            disconnect_task.cancel()
+            if not query_task.done():
+                cancel.set()
 
     @app.post("/admin/visitors/{visitor_id}/rebuild", tags=["admin"])
     async def force_rebuild(visitor_id: str) -> dict[str, Any]:

@@ -30,7 +30,7 @@ from typing import Any
 
 import aiosqlite
 
-from .config import DB_PATH, POLL_INTERVAL_SECONDS, WORK_DIR, ensure_dirs
+from . import config
 from .db import connect, init_db
 from .sessions import reconstruct_sessions
 
@@ -40,16 +40,18 @@ class VersionMismatchError(Exception):
 
 
 class RebuildWorker:
-    def __init__(self, db_path: Path = DB_PATH, work_dir: Path = WORK_DIR) -> None:
-        self.db_path = db_path
-        self.work_dir = work_dir
+    def __init__(self, db_path: Path | None = None, work_dir: Path | None = None) -> None:
+        # Resolve the configured paths at construction time (not import time)
+        # so tests can relocate the database via monkeypatched config.
+        self.db_path = db_path or config.DB_PATH
+        self.work_dir = work_dir or config.WORK_DIR
         self._stop = asyncio.Event()
         self._task: asyncio.Task | None = None
         self._conn: aiosqlite.Connection | None = None
 
     # ------------------------------------------------------------------ lifecycle
     async def start(self) -> None:
-        ensure_dirs()
+        config.ensure_dirs()
         self._cleanup_stale_work_files()
         self._conn = await connect(self.db_path)
         await init_db(self._conn)
@@ -88,7 +90,7 @@ class RebuildWorker:
                 )
                 if not row:
                     try:
-                        await asyncio.wait_for(self._stop.wait(), timeout=POLL_INTERVAL_SECONDS)
+                        await asyncio.wait_for(self._stop.wait(), timeout=config.POLL_INTERVAL_SECONDS)
                     except asyncio.TimeoutError:
                         pass
                     continue
@@ -97,7 +99,7 @@ class RebuildWorker:
             except asyncio.CancelledError:
                 raise
             except Exception:  # keep the loop alive; the row stays pending
-                await asyncio.sleep(POLL_INTERVAL_SECONDS)
+                await asyncio.sleep(config.POLL_INTERVAL_SECONDS)
 
     # ------------------------------------------------------------------ one job
     async def _process_one(self, visitor_id: str, target_version: int) -> None:

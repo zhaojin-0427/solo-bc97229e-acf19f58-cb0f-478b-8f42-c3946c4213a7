@@ -1,7 +1,7 @@
 """Pydantic request/response models."""
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -75,3 +75,35 @@ class VisitorSessionsResponse(BaseModel):
     # latest correction has been published.
     input_version: int | None = None
     generations: list[VisitorVersionOut]
+
+
+class AnalyticsQueryRequest(BaseModel):
+    """One read-only SQL statement for the analytics endpoint.
+
+    Must be a single SQLite ``SELECT`` (``WITH`` clauses allowed) reading
+    only the ``current_sessions`` table and the JSON expansion of its
+    ``page_paths`` column (``json_each`` / ``json_tree``).
+    """
+
+    sql: str = Field(
+        ...,
+        min_length=1,
+        max_length=100_000,
+        examples=[
+            "SELECT visitor_id, COUNT(*) AS sessions, "
+            "SUM(end_ts - start_ts) AS total_seconds "
+            "FROM current_sessions GROUP BY visitor_id"
+        ],
+    )
+
+
+class AnalyticsQueryResponse(BaseModel):
+    # Column names of the result set, in order.
+    columns: list[str]
+    # Result rows as JSON value arrays aligned with ``columns``; at most
+    # ANALYTICS_MAX_ROWS (1000) rows are returned.
+    rows: list[list[Any]]
+    # Number of rows actually returned (len(rows)).
+    row_count: int
+    # True when the query produced more rows than the 1000-row cap.
+    truncated: bool

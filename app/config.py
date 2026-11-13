@@ -19,6 +19,12 @@ RUN_WORKER_IN_PROCESS = os.getenv("RUN_WORKER_IN_PROCESS", "false").lower() == "
 # or an exit event is encountered.
 SESSION_GAP_SECONDS = 30 * 60
 
+# Read-only analytics endpoint (/analytics/query): total budget in seconds for
+# executing the analyst SQL and fetching its rows, and the maximum number of
+# rows returned per query.
+ANALYTICS_TIMEOUT_SECONDS = float(os.getenv("ANALYTICS_TIMEOUT_SECONDS", "2.0"))
+ANALYTICS_MAX_ROWS = int(os.getenv("ANALYTICS_MAX_ROWS", "1000"))
+
 
 def ensure_dirs() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)

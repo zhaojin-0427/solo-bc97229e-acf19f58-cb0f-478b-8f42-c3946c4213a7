@@ -33,6 +33,20 @@ def call(method: str, path: str, payload: dict | None = None) -> dict:
         raise SystemExit(f"HTTP {exc.code} on {method} {path}: {exc.read().decode()}")
 
 
+def call_allow_error(method: str, path: str, payload: dict | None = None) -> tuple[int, dict]:
+    """Like call(), but returns (status, body) instead of exiting on errors."""
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(
+        BASE + path, data=data, method=method,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status, json.loads(resp.read().decode())
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read().decode())
+
+
 def wait_published(visitor_id: str) -> dict:
     deadline = time.time() + 15
     while time.time() < deadline:
@@ -107,6 +121,39 @@ def main() -> None:
     # 4. Idempotent resubmission changes nothing.
     print("\nunchanged resubmission:",
           json.dumps(call("POST", "/logs", {"logs": [batch[0]]}), ensure_ascii=False))
+
+    # 5. Read-only analytics SQL over current_sessions (newest generation only).
+    print("\n=== analytics: per-visitor session count and reading seconds ===")
+    status, body = call_allow_error("POST", "/analytics/query", {"sql": """
+        SELECT visitor_id, COUNT(*) AS sessions,
+               SUM(end_ts - start_ts) AS total_seconds
+        FROM current_sessions GROUP BY visitor_id ORDER BY total_seconds DESC
+    """})
+    print(f"  [{status}]", json.dumps(body, ensure_ascii=False))
+
+    print("\n=== analytics: topic depth for a chosen page set (json_each) ===")
+    status, body = call_allow_error("POST", "/analytics/query", {"sql": """
+        SELECT je.value AS page_path, COUNT(*) AS visits
+        FROM current_sessions AS s JOIN json_each(s.page_paths) AS je
+        WHERE je.value IN ('/products/42', '/pricing', '/blog')
+        GROUP BY je.value ORDER BY visits DESC
+    """})
+    print(f"  [{status}]", json.dumps(body, ensure_ascii=False))
+
+    print("\n=== analytics: forbidden queries are rejected ===")
+    for label, sql in [
+        ("read raw logs", "SELECT * FROM raw_logs"),
+        ("read older session generations", "SELECT * FROM sessions"),
+        ("read the schema", "SELECT sql FROM sqlite_master"),
+        ("subqueries are restricted too",
+         "SELECT * FROM current_sessions WHERE visitor_id IN "
+         "(SELECT visitor_id FROM raw_logs)"),
+        ("dangerous function", "SELECT load_extension('/tmp/evil')"),
+        ("attach another database", "ATTACH DATABASE '/data/portal.db' AS stolen"),
+        ("write attempt", "DELETE FROM current_sessions"),
+    ]:
+        status, body = call_allow_error("POST", "/analytics/query", {"sql": sql})
+        print(f"  [{status}] {label}: {json.dumps(body, ensure_ascii=False)}")
 
 
 if __name__ == "__main__":

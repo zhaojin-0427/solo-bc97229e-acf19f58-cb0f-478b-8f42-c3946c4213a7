@@ -4,6 +4,10 @@
 访问/退出日志，支持按 `log_id` 补传与更正，在后台重建受影响访客的会话，并通过
 只读接口返回每个访客最新两版会话（旧版 + 新版）。
 
+面向文档团队数据分析师的 **`POST /analytics/query`** 只读 SQL 取数接口：直接对
+`current_sessions` 表（每访客当前已发布版会话）执行单条 SQLite `SELECT`，按自选
+页面组合统计会话数与持续秒数、比较专题阅读深度，全程不暴露原始日志与内部表。
+
 ## 1. 快速启动（Docker Compose）
 
 ```bash
@@ -21,7 +25,9 @@ docker compose up --build
 - ReDoc：<http://localhost:8000/redoc>
 - 健康检查：`GET /health`
 
-在 Swagger UI 中可直接演示「提交 → 更正 → 查询」全流程；也可以运行脚本化演示：
+在 Swagger UI 中可直接演示「提交 → 更正 → 查询」全流程；`/analytics/query`
+内置了专题阅读深度统计与越权拒绝的示例请求（请求体下拉框可选）。也可以运行
+脚本化演示：
 
 ```bash
 python3 scripts/demo.py          # 仅依赖标准库，默认访问 http://localhost:8000
@@ -99,6 +105,53 @@ docker compose down -v          # 同时删除数据卷
 
 将指定访客重新排队（运维/演示辅助）。
 
+### `POST /analytics/query` — 只读 SQL 取数（数据分析师）
+
+对 `current_sessions` 逻辑表执行**单条** SQLite `SELECT`（支持 `WITH`、子查询、
+窗口函数与 JSON 函数）。`current_sessions` 只含每个访客**当前已发布版**会话：
+
+| 列 | 类型 | 含义 |
+| --- | --- | --- |
+| `visitor_id` | TEXT | 访客 ID |
+| `version` | INTEGER | 当前已发布代际版本号 |
+| `session_index` | INTEGER | 会话在代际内的序号 |
+| `start_ts` / `end_ts` | INTEGER | 会话起止（Unix 整秒，`end_ts` 即离开前最后访问） |
+| `page_paths` | TEXT (JSON) | 有序页面路径数组，可用 `json_each` 展开 |
+
+请求与响应：
+
+```json
+{"sql": "SELECT visitor_id, COUNT(*) AS sessions, SUM(end_ts - start_ts) AS total_seconds FROM current_sessions GROUP BY visitor_id"}
+```
+
+```json
+{
+  "columns": ["visitor_id", "sessions", "total_seconds"],
+  "rows": [["visitor-7", 2, 2460]],
+  "row_count": 1,
+  "truncated": false
+}
+```
+
+- 最多返回 **1000 行**；结果更长时 `truncated=true` 且只含前 1000 行。
+- **执行 + 取数合计限 2 秒**（`ANALYTICS_TIMEOUT_SECONDS` 可调），超时返回
+  `504` 并**实际终止计算**；客户端断连同样立即中止（返回 `499`）。
+- 专题阅读深度示例（自选页面组合 + JSON 展开，更多示例见 Swagger UI）：
+
+```sql
+SELECT je.value AS page_path, COUNT(*) AS visits,
+       SUM(s.end_ts - s.start_ts) AS session_seconds
+FROM current_sessions AS s
+JOIN json_each(s.page_paths) AS je
+WHERE je.value IN ('/news/ai-2026', '/news/llm')
+GROUP BY je.value ORDER BY visits DESC
+```
+
+- 错误码：`400` 非单条 SELECT / 语法错误；`403` 越权（读取未暴露的表、
+  函数或操作）；`499` 客户端断连；`504` 超时。
+
+安全与一致性设计见第 4 节。
+
 ## 4. 并发与一致性设计（对应关键约束）
 
 ```
@@ -111,9 +164,10 @@ worker 容器 ──计算── work/rebuild-*.db（独立临时库，用完即
 - **重建不占用正式库写事务**：重计算只发生在 `WORK_DIR` 下的独立 SQLite
   临时库；对正式库只有一次只读事务（取该访客全部原始日志）和一次
   `BEGIN IMMEDIATE` 短发布事务。重建期间 API 持续接收日志、持续返回旧会话。
-- **版本号 + 比较并交换（CAS）发布**：每次被接受的更正使相关访客版本 +1，
-  待处理行记录目标版本。发布时若发现输入版本已前进（说明重建期间又有补传/
-  更正），本次结果作废并按最新版本重新排队——**迟到计算永远不会覆盖新结果**。
+- **版本号 + 比较并交换（CAS）发布**：每个实际改变访客输入的批次使该访客
+  版本 +1，待处理行记录目标版本。发布时若发现输入版本已前进（说明重建期间
+  又有补传/更正），本次结果作废并按最新版本重新排队——**迟到计算永远不会
+  覆盖新结果**。
 - **整访客整体替换**：发布在一个事务内删除待处理行、写入整代会话、登记
   代际并裁剪到最新两版，读者不会看到半个结果。已确认的补传在发布前必然
   已计入目标版本，因此发布天然包含全部已确认变更。
@@ -126,6 +180,41 @@ worker 容器 ──计算── work/rebuild-*.db（独立临时库，用完即
   由 SQLite 锁配合 5 秒忙等待串行化（队列行本身也保证同一访客同一时刻
   只有一个重建任务）。
 
+### 只读 SQL 取数的安全与一致性
+
+```
+POST /analytics/query
+   │  ① 独立只读连接 + 单个只读事务抽取当前已发布版（WAL：补传/发布不阻塞）
+   ▼
+current_sessions 快照行 ──②装入──▶ 私有内存 SQLite 库（仅此一张表）
+                                      │ ③ 分析师 SQL 在沙箱内执行：
+                                      │   首关键字校验（SELECT/WITH）
+                                      │   SQLite authorizer 白名单（表/函数/操作）
+                                      │   PRAGMA query_only + LIMIT_ATTACHED=0
+                                      │   progress handler：2 秒 deadline / 断连即中断
+                                      ▼
+                                   列名 + 最多 1000 行 + truncated
+```
+
+- **同一发布快照**：每次取数先在正式库的**一个只读事务**内抽取
+  `current_sessions`（每访客 `MAX(version)` 的已发布代际），期间补传与后台
+  发布照常进行；随后分析师 SQL 只面向该快照，绝不看到两半代际的混合。
+- **物理隔离**：快照行被装入每次查询新建的**内存库**，其中只有
+  `current_sessions` 一张表。原始日志、旧版会话、库结构与其他表根本不在
+  该库中，`ATTACH` 也被授权器与 `SQLITE_LIMIT_ATTACHED=0` 双重禁止。
+- **授权器白名单**（子查询同样受限）：仅放行 `SQLITE_SELECT`/`RECURSIVE`、
+  对 `current_sessions`（及 `json_each`/`json_tree` 展开）和本查询自建 CTE
+  的读、以及一份内置函数白名单（标量/聚合/窗口/日期/JSON 函数；
+  `load_extension`、`random`、`sqlite_version` 等一律拒绝）。写操作、DDL、
+  `PRAGMA`、`ATTACH`、事务语句默认全拒。`json_each`/`json_tree` 在安装
+  授权器前预热，避免其首次模块解析触碰 `sqlite_master`。
+- **限时与释放**：连接上的 progress handler 每 1000 条 VM 指令检查一次
+  deadline 与取消标记；超时（504）或客户端断连（499）都会**中断 SQLite
+  虚拟机实际计算**并关闭沙箱连接。每个查询使用独立线程与独立内存库，
+  并行正常查询与日志写入互不影响。
+- **行数上限**：最多取 1000 行（多取 1 行用于置 `truncated`），
+  `SQLITE_LIMIT_LENGTH`/`SQLITE_LIMIT_SQL_LENGTH` 等也已收紧。
+
 ### 数据表
 
 | 表 | 作用 |
@@ -135,6 +224,7 @@ worker 容器 ──计算── work/rebuild-*.db（独立临时库，用完即
 | `pending_rebuilds` | 持久化重建队列（`pending` / `processing`） |
 | `sessions` | 已发布会话（JSON 页面序列），整代替换 |
 | `published_generations` | 代际登记，含零会话的空代际，驱动两版保留 |
+| `current_sessions` | **逻辑表**（非物理表）：每访客当前已发布版会话，仅供 `/analytics/query` |
 
 ## 5. 本地开发与测试
 
@@ -159,15 +249,16 @@ RUN_WORKER_IN_PROCESS=true DATA_DIR=./data uvicorn app.main:app --reload
 
 ```
 app/
-  config.py        环境变量与常量（30 分钟阈值、数据目录等）
+  config.py        环境变量与常量（30 分钟阈值、数据目录、取数限时/限行等）
   db.py            连接与建表（WAL、显式事务）
   sessions.py      纯函数：事件排序与会话切分
   schemas.py       Pydantic 请求/响应模型与校验
+  analytics.py     只读取数：快照抽取、内存沙箱、授权器白名单、限时中断
   worker.py        后台重建：领取 → 临时库 → 计算 → CAS 发布
   worker_main.py   worker 容器入口
-  main.py          FastAPI：/logs、查询、管理接口
+  main.py          FastAPI：/logs、查询、/analytics/query、管理接口
 scripts/
-  demo.py          标准库演示脚本（提交、更正、换人、查询）
+  demo.py          标准库演示脚本（提交、更正、换人、查询、SQL 取数与越权拒绝）
   offline_smoke.py 离线冒烟测试
 tests/             pytest 单元与端到端测试
 docker-compose.yml  api + worker 双容器 + 共享数据卷
